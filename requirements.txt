@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+yt-dlp
+openai-whisper
+ollama
+psycopg2-binary
+sqlalchemy
+ffmpeg-python
+langchain_community
+langchain
+langchain-text-splitters
+uvicorn
