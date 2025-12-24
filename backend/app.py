@@ -1,4 +1,5 @@
-# Modified app.py (only showing the updated /ingest endpoint and relevant imports; replace in your existing app.py)
+# app.py - Final version with video_description, separate audio/visual chunks, LLaVA for frame descriptions,
+# and fixed yt-dlp download with binary
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,171 +8,239 @@ import subprocess
 import whisper
 import ollama
 import os
-from sqlalchemy import text
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import psycopg2 as pg
+from pathlib import Path
 import json
 import uvicorn
+import shutil
+import easyocr
 
 app = FastAPI()
+ocr_reader = easyocr.Reader(['en'], gpu=False)
 
 # Allow CORS for your frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000"],  # Update if your frontend port changes
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Load database config
 config_file_path = './config.json'
 try:
     with open(config_file_path, 'r', encoding='utf-8') as file:
         config_data = json.load(file)
-
-except FileNotFoundError:
-    print(f"Error: The file '{config_file_path}' was not found.")
-    config_data = {} 
-except json.JSONDecodeError:
-    print("Error: Failed to decode JSON from the file. Check file formatting.")
+except (FileNotFoundError, json.JSONDecodeError):
     config_data = {}
 
+# Database connection
 try:
     conn = pg.connect(
-        user=config_data.get('database')['user'],
-        password=config_data.get('database')['password'],
-        host=config_data.get('database')['host'], 
-        port=config_data.get('database')['port']         
+        user=config_data.get('database', {}).get('user'),
+        password=config_data.get('database', {}).get('password'),
+        host=config_data.get('database', {}).get('host', 'localhost'),
+        port=config_data.get('database', {}).get('port', 5432),
+        dbname=config_data.get('database', {}).get('database', 'video_chunks')
     )
 except pg.OperationalError as e:
-    print(f"An error occurred: {e}")
-
+    print(f"Database connection error: {e}")
+    raise
 
 class VideoURL(BaseModel):
     url: str
+    description: str = ""  # Optional user-provided description
 
 class Query(BaseModel):
     question: str
-    video_id: str
-    top_k: int = 5
+    video_url: str
+    top_k: int = 8
+
+@app.get("/list-videos")
+async def list_videos():
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT video_url, video_description 
+                FROM video_chunks 
+                ORDER BY video_description ASC
+            """)
+            rows = cur.fetchall()
+            return [{"url": row[0], "description": row[1] or "No description"} for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ingest-video")
+async def ingest_video(data: VideoURL):
+    try:
+        video_url = data.url.strip()
+        if not video_url:
+            raise HTTPException(status_code=400, detail="URL is required")
+
+        user_description = data.description.strip() or f"Video from {video_url.split('?')[0]}"
+
+        video_id = video_url.split('v=')[-1] if 'youtube' in video_url else f"video_{os.urandom(4).hex()}"
+        mp4_path = f"{video_id}.mp4"
+        transcript_path = f"{video_id}_transcript.txt"
+        frames_dir = f"frames_{video_id}"
+        Path(frames_dir).mkdir(exist_ok=True)
+
+        # Download video (using your working yt-dlp binary)
+        subprocess.run([
+            './yt-dlp_macos',
+            '--no-check-certificate',
+            '-f', 'bestvideo+bestaudio/best',
+            '--merge-output-format', 'mp4',
+            '--remux-video', 'mp4',
+            video_url,
+            '-o', mp4_path
+        ], check=True)
+
+        # Extract frames every 10 seconds
+        subprocess.run([
+            'ffmpeg', '-i', mp4_path,
+            '-vf', 'fps=1/10',
+            f'{frames_dir}/frame_%04d.png'
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Transcribe audio
+        whisper_model = whisper.load_model("base")
+        result = whisper_model.transcribe(mp4_path, verbose=False)
+
+        # Write transcript
+        with open(transcript_path, "w") as f:
+            for seg in result['segments']:
+                f.write(f"[{seg['start']:.1f}-{seg['end']:.1f}s]: {seg['text'].strip()}\n")
+
+        # Chunk audio transcript
+        loader = TextLoader(transcript_path)
+        docs = loader.load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=20)
+        audio_chunks = splitter.split_documents(docs)
+
+        # Process frames with EasyOCR
+        frame_files = sorted(Path(frames_dir).glob("frame_*.png"))
+        visual_chunks = []
+
+        for i, frame_path in enumerate(frame_files):
+            timestamp = i * 10  # seconds
+
+            # OCR
+            ocr_result = ocr_reader.readtext(str(frame_path))
+            ocr_text = " ".join([text for _, text, _ in ocr_result])  # Extract all detected text
+
+            full_visual_text = f"[Frame at {timestamp}s]\nOCR text: {ocr_text}"
+
+            # Embed
+            emb = ollama.embeddings(model='nomic-embed-text', prompt=full_visual_text)['embedding']
+
+            visual_chunks.append({
+                'chunk_text': full_visual_text,
+                'embedding': emb,
+                'image_path': str(frame_path),
+                'timestamp_start': timestamp,
+                'timestamp_end': timestamp + 10
+            })
+
+        # Store in DB
+        with conn.cursor() as cur:
+            # Audio chunks
+            for chunk in audio_chunks:
+                emb = ollama.embeddings(model='nomic-embed-text', prompt=chunk.page_content)['embedding']
+                cur.execute("""
+                    INSERT INTO video_chunks (video_url, video_description, chunk_type, chunk_text, embedding, timestamp_start, timestamp_end)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (video_url, user_description, 'audio', chunk.page_content, emb, None, None))
+
+            # Visual chunks (OCR only)
+            for v_chunk in visual_chunks:
+                cur.execute("""
+                    INSERT INTO video_chunks (video_url, video_description, chunk_type, chunk_text, embedding, image_path, timestamp_start, timestamp_end)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    video_url, user_description, 'visual', v_chunk['chunk_text'], v_chunk['embedding'],
+                    v_chunk['image_path'], v_chunk['timestamp_start'], v_chunk['timestamp_end']
+                ))
+
+            conn.commit()
+
+        # Cleanup
+        shutil.rmtree(frames_dir)
+        os.remove(mp4_path)
+        os.remove(transcript_path)
+
+        return {
+            "status": "success",
+            "video_url": video_url,
+            "video_description": user_description,
+            "audio_chunks": len(audio_chunks),
+            "visual_chunks": len(frame_files),
+            "message": "Video ingested with audio transcript and OCR from frames!"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
 @app.post("/query")
 async def query_rag(data: Query):
     try:
-        # Embed the question
-        emb_response = ollama.embeddings(
-            model='nomic-embed-text',
-            prompt=data.question
-        )
-        query_emb = emb_response['embedding']  # This is a list of floats
+        q_emb = ollama.embeddings(model='nomic-embed-text', prompt=data.question)['embedding']
 
-        # Retrieve top-k chunks (cast query_emb to vector)
         with conn.cursor() as cur:
+            # Top-k audio chunks
             cur.execute("""
-                SELECT chunk_text, embedding <=> %s::vector AS distance
+                SELECT chunk_text
                 FROM video_chunks
-                WHERE video_id = %s
+                WHERE video_url = %s AND chunk_type = 'audio'
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            """, (query_emb, data.video_id, query_emb, data.top_k))
-            
-            results = cur.fetchall()
+            """, (data.video_url, q_emb, data.top_k))
+            audio_results = [row[0] for row in cur.fetchall()]
 
-        if not results:
-            return {"response": "No relevant chunks found for this video.", "sources": []}
+            # Top-k visual chunks (OCR text)
+            cur.execute("""
+                SELECT chunk_text, image_path
+                FROM video_chunks
+                WHERE video_url = %s AND chunk_type = 'visual'
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (data.video_url, q_emb, data.top_k))
+            visual_results = cur.fetchall()
 
-        # Extract text and prepare context
-        context = []
-        sources = []
-        for row in results:
-            chunk_text = row[0]
-            distance = row[1]
-            context.append(chunk_text)
-            sources.append({"text": chunk_text, "similarity": 1 - distance})
+        # Combine context
+        context_parts = [f"[Audio]: {text}" for text in audio_results]
+        image_paths = []  # Not used for generation (no LLaVA)
+        for text, img_path in visual_results:
+            context_parts.append(f"[Visual OCR]: {text}")
 
-        # Build prompt
-        context_str = "\n\n".join(context)
-        prompt = f"""You are an expert at answering questions about video content.
-Use ONLY the provided context from the video transcript. Be accurate, concise, and reference timestamps if relevant.
+        context = "\n\n".join(context_parts)
+
+        prompt = f"""You are an expert on this video. Use the audio transcript and OCR-extracted text from frames to answer accurately.
 
 Context:
-{context_str}
+{context}
 
 Question: {data.question}
 
 Answer:"""
 
+        # Generate with text LLM
         response = ollama.generate(
-            model=config_data.get("model")["name"],
-            prompt=prompt,
-            options={"temperature": 0.7}
+            model='mistral',
+            prompt=prompt
         )['response']
 
         return {
             "response": response.strip(),
-            "sources": sources
+            "audio_retrieved": len(audio_results),
+            "visual_retrieved": len(visual_results)
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
-
-@app.post("/ingest-video")
-async def ingest_video(data: VideoURL):
-    try:
-        # Generate unique video_id (use URL hash or random)
-        video_id = data.url.split('v=')[-1] if 'youtube' in data.url else f"video_{os.urandom(4).hex()}"
-        
-        mp4_path = f"{video_id}.mp4"
-        mp3_path = f"{video_id}.mp3"
-        transcript_path = f"{video_id}_transcript.txt"
-
-        # Step 1: Download video with yt-dlp
-        subprocess.run(['yt-dlp', '--no-check-certificate', data.url, '-o', mp4_path], check=True)
-
-        # Step 2: Extract audio with FFmpeg
-        subprocess.run(['ffmpeg', '-i', mp4_path, '-q:a', '0', '-map', 'a', mp3_path], check=True)
-
-        # Step 3: Transcribe with Whisper
-        model = whisper.load_model("base")  # or "base" for faster testing
-        result = model.transcribe(mp3_path, verbose=False)
-
-        # Write transcript with timestamps to file
-        with open(transcript_path, "w") as f:
-            for segment in result['segments']:
-                f.write(f"[{segment['start']}-{segment['end']}s]: {segment['text']}\n")
-
-        # Step 4: Chunk with LangChain
-        loader = TextLoader(transcript_path)
-        text_documents = loader.load()
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=20)
-        documents = text_splitter.split_documents(text_documents)
-
-        # Step 5: Embed and store in PG-vector
-        with conn.cursor() as cur: 
-            for doc in documents:
-                emb = ollama.embeddings(model='nomic-embed-text', prompt=doc.page_content)['embedding']
-                cur.execute("""
-                    INSERT INTO video_chunks (video_id, chunk_text, embedding)
-                    VALUES (%s, %s, %s)
-                """, (video_id, doc.page_content, emb))
-            conn.commit()
-
-        # Cleanup files
-        for path in [mp4_path, mp3_path, transcript_path]:
-            if os.path.exists(path):
-                os.remove(path)
-
-        return {
-            "status": "success",
-            "video_id": video_id,
-            "chunk_count": len(documents),
-            "message": "Video processed, transcribed, chunked, and ingested into database."
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == '__main__':
