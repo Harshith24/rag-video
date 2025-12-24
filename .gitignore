@@ -1,2 +1,3 @@
 .venv/
 backend/config.json
+backend/.DS_Store

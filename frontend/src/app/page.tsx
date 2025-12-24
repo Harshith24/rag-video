@@ -1,67 +1,121 @@
-// app/page.tsx
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 
+// --- Interfaces ---
 interface Message {
   role: 'user' | 'assistant';
   content: string;
 }
 
-interface VideoChat {
-  videoId: string;
-  title: string; // Optional: can use URL or extract title later
+interface ChatSession {
+  id: string;          // Backend Video ID
+  uniqueId: string;    // Frontend Session ID
+  title: string;       // User friendly title
   messages: Message[];
 }
 
 export default function Home() {
-  const [url, setUrl] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState('');
-  const [videos, setVideos] = useState<VideoChat[]>([]); // List of ingested videos/chats
-  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
-  const [question, setQuestion] = useState('');
-  const [currentMessages, setCurrentMessages] = useState<Message[]>([]);
+  // --- State ---
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
 
-  const handleProcess = async () => {
-    if (!url) return;
+  // Inputs
+  const [urlInput, setUrlInput] = useState('');
+  const [titleInput, setTitleInput] = useState('');
+  const [questionInput, setQuestionInput] = useState('');
+  
+  // Status
+  const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState('');
+
+  // Auto-scroll
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeChat = sessions.find(s => s.uniqueId === activeSessionId);
+
+  // --- Handlers ---
+  // 1. Load sidebar list from backend on mount
+  useEffect(() => {
+    fetchVideosFromDB();
+  }, []);
+
+  const fetchVideosFromDB = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/list-videos');
+      if (!res.ok) {
+        console.error("Failed to fetch videos:", res.statusText);
+        return;
+      }
+      const data = await res.json();
+      // Ensure data is an array
+      if (!Array.isArray(data)) {
+        console.error("Expected array but got:", data);
+        setSessions([]);
+        return;
+      }
+      // Map DB rows to our session format
+      const loadedSessions = data.map((v: any) => ({
+        id: v.url, 
+        uniqueId: v.url, 
+        title: v.description, // DB description becomes sidebar title
+        messages: []
+      }));
+      setSessions(loadedSessions);
+    } catch (err) {
+      console.error("Failed to load history", err);
+      setSessions([]);
+    }
+  };
+
+  const handleIngest = async () => {
+    if (!urlInput) return;
     setLoading(true);
-    setStatus('Processing video...');
+    setStatusText('Downloading and processing...');
 
     try {
       const res = await fetch('http://localhost:8000/ingest-video', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ 
+          url: urlInput,
+          description: titleInput || `Video ${sessions.length + 1}`
+        }),
       });
 
       if (!res.ok) throw new Error(await res.text());
 
       const data = await res.json();
-      const videoId = data.video_id;
+      const videoUrl = data.video_url;
 
-      // Add new chat session
-      setVideos(prev => [
-        ...prev,
-        { videoId, title: url.split('/').pop() || 'Video', messages: [] }
-      ]);
-      setActiveVideoId(videoId);
-      setCurrentMessages([]);
-      setStatus(`Ingested successfully! (${data.chunk_count} chunks)`);
-      setUrl(''); // Clear input
+      const newSession: ChatSession = {
+        id: videoUrl,
+        uniqueId: videoUrl,
+        title: data.video_description || titleInput || `Video ${sessions.length + 1}`,
+        messages: []
+      };
+
+      setSessions([newSession, ...sessions]);
+      setActiveSessionId(videoUrl);
+      
+      // Cleanup
+      setUrlInput('');
+      setTitleInput('');
+      setStatusText('');
     } catch (err) {
-      setStatus(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      alert(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
       setLoading(false);
     }
   };
 
   const handleSend = async () => {
-    if (!question.trim() || !activeVideoId) return;
+    if (!questionInput.trim() || !activeChat) return;
 
-    const userMessage: Message = { role: 'user', content: question };
-    setCurrentMessages(prev => [...prev, userMessage]);
-    setQuestion('');
+    const currentQ = questionInput;
+    setQuestionInput(''); // Clear input
+    
+    // 1. Add User Message to UI
+    addMessageToSession(activeChat.uniqueId, { role: 'user', content: currentQ });
     setLoading(true);
 
     try {
@@ -69,144 +123,156 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          question,
-          video_id: activeVideoId,
-          top_k: 5
+          question: currentQ,
+          video_url: activeChat.id,
+          top_k: 8
         }),
       });
 
       if (!res.ok) throw new Error(await res.text());
-
       const data = await res.json();
 
-      const aiMessage: Message = { role: 'assistant', content: data.response };
-      setCurrentMessages(prev => [...prev, aiMessage]);
+      // 2. Add AI Response to UI
+      addMessageToSession(activeChat.uniqueId, { role: 'assistant', content: data.response });
 
-      // Update chat history in videos list
-      setVideos(prev =>
-        prev.map(v =>
-          v.videoId === activeVideoId
-            ? { ...v, messages: [...v.messages, userMessage, aiMessage] }
-            : v
-        )
-      );
     } catch (err) {
-      setCurrentMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: `Error: ${err instanceof Error ? err.message : 'Failed to query'}` }
-      ]);
+      addMessageToSession(activeChat.uniqueId, { role: 'assistant', content: "Error: Failed to get response." });
     } finally {
       setLoading(false);
     }
   };
 
-  // Get active chat messages
-  const activeChat = videos.find(v => v.videoId === activeVideoId);
+  const addMessageToSession = (uniqueId: string, msg: Message) => {
+    setSessions(prev => prev.map(s => 
+      s.uniqueId === uniqueId 
+        ? { ...s, messages: [...s.messages, msg] } 
+        : s
+    ));
+  };
 
+  const handleDelete = (e: React.MouseEvent, uniqueId: string) => {
+    e.stopPropagation();
+    setSessions(prev => prev.filter(s => s.uniqueId !== uniqueId));
+    if (activeSessionId === uniqueId) setActiveSessionId(null);
+  };
+
+  // --- Render ---
   return (
-    <div className="flex h-screen bg-gray-100">
-      {/* Sidebar: List of ingested videos */}
-      <aside className="w-64 bg-white border-r p-4 overflow-y-auto">
-        <h2 className="text-lg font-bold mb-4">Your Videos</h2>
-        {videos.length === 0 ? (
-          <p className="text-gray-500">No videos processed yet.</p>
-        ) : (
-          <ul>
-            {videos.map(video => (
-              <li key={video.videoId}>
-                <button
-                  onClick={() => {
-                    setActiveVideoId(video.videoId);
-                    setCurrentMessages(video.messages);
-                  }}
-                  className={`w-full text-left p-2 rounded mb-2 ${
-                    activeVideoId === video.videoId ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100'
-                  }`}
-                >
-                  {video.title}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+    <div className="app-container">
+      
+      {/* Sidebar */}
+      <aside className="sidebar">
+        <div className="new-chat-btn-container">
+          <button className="new-chat-btn" onClick={() => setActiveSessionId(null)}>
+            + New Video Chat
+          </button>
+        </div>
+        <ul className="history-list">
+          {sessions.map(chat => (
+            <li 
+              key={chat.uniqueId} 
+              className={`history-item ${activeSessionId === chat.uniqueId ? 'active' : ''}`}
+              onClick={() => setActiveSessionId(chat.uniqueId)}
+            >
+              <span>{chat.title}</span>
+              <button className="delete-btn" onClick={(e) => handleDelete(e, chat.uniqueId)}>×</button>
+            </li>
+          ))}
+        </ul>
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col">
-        {/* Header */}
-        <header className="bg-white border-b p-4 flex items-center">
-          <input
-            type="text"
-            placeholder="Paste YouTube URL here..."
-            value={url}
-            onChange={e => setUrl(e.target.value)}
-            className="flex-1 p-2 border rounded mr-2"
-            disabled={loading}
-          />
-          <button
-            onClick={handleProcess}
-            disabled={loading || !url.trim()}
-            className="px-4 py-2 bg-blue-600 text-white rounded disabled:bg-gray-400"
-          >
-            {loading ? 'Processing...' : 'Ingest'}
-          </button>
-        </header>
+      <main className="main-content">
+        
+        {/* VIEW 1: Create New Chat */}
+        {!activeSessionId && (
+          <div className="empty-state">
+            <div className="ingest-card">
+              <h2>Setup New Chat</h2>
+              
+              <div className="form-group">
+                <label>Chat Name (Optional)</label>
+                <input 
+                  type="text" 
+                  className="form-input"
+                  placeholder="e.g. Cooking Tutorial"
+                  value={titleInput}
+                  onChange={e => setTitleInput(e.target.value)}
+                />
+              </div>
 
-        {/* Status */}
-        {status && <p className="p-4 text-center text-green-600">{status}</p>}
+              <div className="form-group">
+                <label>YouTube URL</label>
+                <input 
+                  type="text" 
+                  className="form-input"
+                  placeholder="https://youtube.com/..."
+                  value={urlInput}
+                  onChange={e => setUrlInput(e.target.value)}
+                />
+              </div>
 
-        {/* Chat Area */}
-        <div className="flex-1 p-4 overflow-y-auto bg-gray-50">
-          {!activeVideoId ? (
-            <div className="text-center text-gray-500 mt-20">
-              <p>Ingest a video to start chatting!</p>
+              {statusText && <p style={{color: '#3b82f6', textAlign: 'center'}}>{statusText}</p>}
+
+              <button 
+                className="primary-btn"
+                onClick={handleIngest}
+                disabled={loading || !urlInput}
+              >
+                {loading ? 'Processing...' : 'Start Chat'}
+              </button>
             </div>
-          ) : (
-            <div className="space-y-4">
-              {currentMessages.map((msg, idx) => (
-                <div
-                  key={idx}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                >
-                  <div
-                    className={`max-w-[80%] p-3 rounded-lg ${
-                      msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-white shadow'
-                    }`}
-                  >
+          </div>
+        )}
+
+        {/* VIEW 2: Active Chat */}
+        {activeSessionId && activeChat && (
+          <>
+            <header className="chat-header">
+              <h3>{activeChat.title}</h3>
+              <small style={{color: '#888'}}>ID: {activeChat.id}</small>
+            </header>
+
+            <div className="chat-messages">
+              {activeChat.messages.length === 0 && (
+                <div style={{textAlign: 'center', color: '#888', marginTop: '50px'}}>
+                  Ask a question to begin.
+                </div>
+              )}
+              
+              {activeChat.messages.map((msg, i) => (
+                <div key={i} className={`message-row ${msg.role}`}>
+                  <div className={`bubble ${msg.role}`}>
                     {msg.content}
                   </div>
                 </div>
               ))}
-              {loading && (
-                <div className="text-center text-gray-500">Thinking...</div>
-              )}
+              
+              {loading && <div style={{textAlign: 'center', color: '#888'}}>Thinking...</div>}
+              <div ref={messagesEndRef} />
             </div>
-          )}
-        </div>
 
-        {/* Input Area */}
-        {activeVideoId && (
-          <footer className="p-4 border-t bg-white">
-            <div className="flex">
+            <footer className="chat-input-area">
               <input
-                type="text"
-                placeholder="Ask anything about this video..."
-                value={question}
-                onChange={e => setQuestion(e.target.value)}
+                className="form-input"
+                placeholder="Type your question..."
+                value={questionInput}
+                onChange={e => setQuestionInput(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleSend()}
-                className="flex-1 p-3 border rounded-l-lg focus:outline-none"
                 disabled={loading}
               />
-              <button
+              <button 
+                className="primary-btn" 
+                style={{width: 'auto', marginTop: 0}}
                 onClick={handleSend}
-                disabled={loading || !question.trim()}
-                className="px-6 py-3 bg-blue-600 text-white rounded-r-lg disabled:bg-gray-400"
+                disabled={loading}
               >
                 Send
               </button>
-            </div>
-          </footer>
+            </footer>
+          </>
         )}
+
       </main>
     </div>
   );
